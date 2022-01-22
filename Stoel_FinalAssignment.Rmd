@@ -1,0 +1,459 @@
+---
+title: "Bayes Assignment"
+author: "Lauke"
+date: "05/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Setting seed}
+set.seed(456)
+```
+
+```{r Libraries include = F}
+library(tidyverse)
+library(knitr)
+library(gridExtra)
+library(moments)
+library(bain)
+```
+### Data prep
+```{r Read in data + tidy up}
+setwd("C:/Users/lasto/OneDrive/Documents/Masters/Rwork/Bayes")
+dat.raw <- read.csv("DryEyesData.csv", header = T)
+
+#tidy data
+dat.tidy <- dat.raw %>%  #rename variables
+  rename(week0.screentime = Baseline, week0.OSDI = X, week2.course_hrs = Week.2, week2.study_hrs = X.1, week2.leis_hrs = X.2, week2.OSDI = X.3, 
+         week4.course_hrs = Week.4, week4.study_hrs = X.4, week4.leis_hrs = X.5, week4.OSDI = X.6, 
+         week6.course_hrs = Week.6, week6.study_hrs = X.7, week6.leis_hrs = X.8, week6.OSDI = X.9) %>% 
+  filter(Subject.Number != "NA") %>% #remove empty first row
+  mutate_at(vars(starts_with("week"), starts_with("base")), (as.numeric)) %>% #store as numeric
+  mutate(Sex = ifelse(Sex == "Male", 0 , 1)) #dummy code
+
+#create sums of screentime
+week2.screentime <- dat.tidy %>% select(starts_with("week2")) %>% select(-contains("OSDI")) %>% rowSums()
+week4.screentime <- dat.tidy %>% select(starts_with("week4")) %>% select(-contains("OSDI")) %>% rowSums()
+week6.screentime <- dat.tidy %>% select(starts_with("week6")) %>% select(-contains("OSDI")) %>% rowSums()
+#create dataset to work with: 
+dat <- cbind(dat.tidy[,1:5], week2.screentime, dat.tidy$week2.OSDI, week4.screentime, dat.tidy$week4.OSDI, week6.screentime, dat.tidy$week6.OSDI)
+dat <- dat %>% rename(week2.OSDI = `dat.tidy$week2.OSDI`, week4.OSDI = `dat.tidy$week4.OSDI`, week6.OSDI = `dat.tidy$week6.OSDI`)
+
+#data in long format too, for later (see Bayes Factor)
+dat.long <- dat %>% pivot_longer(starts_with("week"), names_to = c("Week", ".value"), names_pattern = "week(.).(.*)")
+```
+
+```{r Create variables + preliminary analysis}
+#create first set of difference scores for only week 6: 
+OSDI.diff6 <- dat$week6.OSDI - dat$week0.OSDI
+screen.diff6 <- week6.screentime - dat$week0.screentime
+
+age.gmc <- dat$Age - mean(dat$Age)
+
+#prelim check normality: 
+hist(OSDI.diff6)
+hist(screen.diff6) #most skewed distribution
+hist(age.gmc)
+
+#prelim check relationship
+cor(screen.diff6, OSDI.diff6) #small positive correlation
+cor(age.gmc, OSDI.diff6) #small negative correlation
+```
+###Prep for sampler
+```{r Prior Distributions}
+#means and precision for intercept and beta2: normal with mu and tau
+mu_00 <- 0
+mu_20 <- 0
+
+tau2_00 <- 1000
+tau2_20 <- 1000
+
+#mean and standard deviation for beta1: t-distribution with mu and sd
+mu_10 <- 0.2
+sd_10 <- 0.3
+
+#degrees of freedom for the t-distribution of beta1: 
+df <- 3
+
+#residual variance: inverse gamma with alpha and beta
+a0 <- 0.001
+b0 <- 0.001
+```
+
+```{r Prep for MH}
+# calculate the density of the data: (NB: w.r.t. beta1)
+data_dens <- function(Y, X1, X2, beta0, beta1, beta2, sig2) {
+  exp(-(beta1) ^ 2 * (sum((X1) ^ 2) / (2 * sig2)) + 
+        beta1 * sum(X1 * (Y - beta0 - beta2 * X2)) / sig2)
+}
+# density of the prior distribution (t-dist)
+prior_dens <- function(beta1, mu_10, sd_10, df){
+  (1 + ((beta1 - mu_10)^2) / (df * (sd_10)^2)) ^ (-(df + 1) / 2)
+}
+
+# formula of the shape of the conditional posterior distribution: 
+cond_post <- function(Y, X1, X2, beta0, beta1, beta2, sig2, mu_10, sd_10, df){
+  data_dens(Y, X1, X2, beta0, beta1, beta2, sig2) * prior_dens(beta1, mu_10, sd_10, df)
+}
+
+```
+### Sampler
+```{r The Hecking Ultimate Gibbs Sampler (THUGS)}
+THUGS <- function(Y, X1, X2, inits, n.iters) {
+  
+  storage <- matrix(0, n.iters, 4) #create storage for sampled values of each parameter
+  colnames(storage) <- c("beta0", "beta1", "beta2", "sigma2")
+  storage[1,] <- c(beta0, beta1, beta2, sig2) #make the first value of each parameter the starting value
+  n <- length(Y) #nr of observations in dataset
+  accept.rate <- matrix(0, nrow = n.iters, ncol = 1)
+    
+  for(i in 2:n.iters) { #skip the first entry b/c starting value
+    
+    ###beta0 (Gibbs)
+    tau2_01  <- n / sig2 + 1 / tau2_00 #posterior precision
+    mu_01 <- (sum(Y - beta1 * X1 - beta2 * X2) / sig2 +
+                mu_00 / tau2_00) /
+      tau2_01
+    beta0 <- rnorm(1, mu_01, 1 / tau2_01) #draw sample from normal posterior with initial parameters -> update
+    
+    ###beta1 (Metropolis-Hastings)
+    # 1. sample candidate beta1 value from the normal proposal distribution
+    beta1_star <- rnorm(1, mean = 0.4, sd = 0.1)
+    
+    # 2. sample a reference value
+    u <- runif(1, 0, 1)
+    
+    # 3. Compute acceptance ratio
+    target_prop <- cond_post(Y, X1, X2, beta0, beta1_star, beta2, sig2, mu_10, sd_10, df) /
+      cond_post(Y, X1, X2, beta0, beta1, beta2, sig2, mu_10, sd_10, df)
+    
+    proposal_prop <- dnorm(beta1, mean = 0.2, sd = 0.5) /
+      dnorm(beta1_star, mean= 0.2, sd = 0.5)
+    
+    R <- target_prop * proposal_prop
+    
+    # 4. Accept the candidate value or retain current value
+    if(R >= u) {
+      beta1 <- beta1_star
+      accept.rate[i] <- 1
+    }
+    
+    ###beta2 (Gibbs)
+    tau2_21  <- sum(X2 ^ 2) / sig2 + 1 / tau2_20 
+    mu_21 <- (sum(X2 * (Y - beta0 - beta1 * X1)) / sig2 +
+                mu_20 / tau2_20) /
+      tau2_21
+    beta2 <- rnorm(1, mu_21, 1 / tau2_21)
+    
+    ###sig2 (Gibbs)
+    a1  <- n / 2 + a0
+    b1  <- sum((Y - (beta0 + beta1 * X1 + beta2 * X2)) ^ 2) / 2 + b0
+    sig2 <- 1 / rgamma(1, a1, b1) 
+    
+    # store results
+    storage[i, ] <- c(beta0, beta1, beta2, sig2)
+  }
+  output <- list("storage" = storage, "acceptance rate" = accept.rate)
+  return(output)
+}
+```
+### Run
+```{r Two chains and remove burn-in}
+set.seed(456)
+#Chain 1
+beta0 <- 3 #intercept
+beta1 <- 4 #regression coefficient 1
+beta2 <- -3 #regression coefficient 2
+sig2 <- 50 #variance of the residuals
+
+inits1 <- c(beta0, beta1, beta2, sig2)
+output1 <- THUGS(OSDI.diff6, screen.diff6, age.gmc, inits1, n.iters = 20000) 
+chain1 <- output1$storage
+
+#Chain 2
+beta0 <- -1 #intercept
+beta1 <- -3 #regression coefficient 1
+beta2 <- 6 #regression coefficient 2
+sig2 <- 300 #variance of the residuals
+
+inits2 <- c(beta0, beta1, beta2, sig2)
+output2 <- THUGS(OSDI.diff6, screen.diff6, age.gmc, inits2, n.iters = 20000)
+chain2 <- output2$storage
+
+# Update burn-in period
+unburn1 <- chain1[-c(1:1000),]
+unburn2 <- chain2[-c(1:1000),]
+
+#create a joint posterior
+jointpostAge <- rbind(unburn1, unburn2)
+```
+### Assessing convergence
+```{r Autocorrelations & acceptance rate, echo = F}
+AutoCorrCalc <- function(chain, nlags) {
+  autocorrs <- matrix(0, nrow = nlags, ncol = ncol(chain)) #create storage for all parameters
+  
+  for (k in 1:ncol(autocorrs)) {
+    par1 <- matrix(0, nrow = length(chain[, k]), ncol = nlags) #create storage for 1 parameter
+    
+    for (i in 1:ncol(par1)) {
+      par1[(i:(nrow(chain))), i] <- chain[(1:(nrow(chain) - (i - 1))), k] #create lagging vectors
+    }
+    
+    autocorrs[1, k] <- cor(par1[, 1], par1[, 1]) #fill the first slot with correlation with itself
+    
+    for (j in 1:(ncol(par1) - 1)) {
+      autocorrs[(j + 1), k] <- cor(par1[, 1], par1[, (1 + j)], use = "complete.obs") #correlate 1 with all up to nlags
+    }
+  }
+  autocorrs <- as.data.frame(autocorrs)
+  colnames(autocorrs) <- c("Intercept", "Screentime", "Age", "Residual Variance")
+  return(autocorrs)
+}
+
+autocorrs1 <- AutoCorrCalc(chain1, 40)
+autocorrs2 <- AutoCorrCalc(chain2, 40)
+
+AutoCorrPlotter <- function(autocorrs, nlags) {
+  ACdat <- data.frame(Lag = (1:nlags), autocorrs) #add column with nr. Lags
+  
+  plotlist <- list()
+  for (i in 1:(ncol(ACdat) - 1)) {
+    #create data frame for each parameter with the same names
+    ACdat1 <- as.data.frame(ACdat[, c(1, 1 + i)])
+    colnames(ACdat1) <- c("Lag", "Par")
+    #loop over all parameters to make plot
+    plotlist[[i]] <-
+      ggplot(data = ACdat1, mapping = aes(x = Lag, y = Par)) +
+      geom_hline(aes(yintercept = 0)) +
+      geom_segment(mapping = aes(xend = Lag, yend = 0)) +
+      ylim(-0.2,1) +
+      labs(y = "Autocorrelation") +
+      ggtitle(names(ACdat[(i + 1)])) +
+      theme_classic() +
+      theme(plot.title = element_text(hjust = 0.5))
+  }
+  grid.arrange(grobs = plotlist, ncol = 2) #plot all graphs in a grid
+}
+
+AutoCorrPlotter(autocorrs1, 40)
+AutoCorrPlotter(autocorrs2, 40)
+
+##Acceptance rate
+AR1 <- mean(output1$`acceptance rate`)*100
+AR2 <- mean(output2$`acceptance rate`)*100
+
+```
+
+```{r Gelman Rubin statistic & MC error}
+n.iters <- 20000
+n.chains <- 2
+
+#calculate the between-chain variance
+betweencalc <- function(chain, jointpost) {
+  set <- matrix(0, nrow = 1, ncol = ncol(chain))
+  
+  for (i in 1:ncol(chain)) {
+    set[,i] <- (mean(chain[, i]) - mean(jointpost[, i]))^2
+  }
+  return(set)
+}
+
+between <- n.iters/(n.chains - 1) * (betweencalc(chain1, jointpostAge) + betweencalc(chain2, jointpostAge))
+
+#calculate the within-chain variance
+varone <- cbind(var(chain1[,1]), var(chain1[,2]), var(chain1[,3]), var(chain1[,4]))
+
+vartwo <- cbind(var(chain2[,1]), var(chain2[,2]), var(chain2[,3]), var(chain2[,4]))
+
+within <- (varone + vartwo)/2
+
+#calculate the pooled variance:
+pooledvar <- ((n.iters - 1) / n.iters * within) +
+  (n.chains + 1) / (n.chains * n.iters) * between
+
+#Gelman-Rubin statistic is the proportion of pooled variance to within variance
+GRstat <- pooledvar/within
+
+MCerrcalc <- function(sd, n.iters){
+  MC.error <- sd/sqrt(n.iters)
+  return(MC.error)
+}
+```
+
+```{r Trace plots}
+#Beta 0:
+par(oma=c(3,0,0,0)) 
+par(mar=c(5,4,4,2) + 0.1)
+plot(unburn1[,1], type = "s", xlab = "Nr. of iterations", ylab = "", main = "Intercept", col = "red")
+lines(unburn2[,1], type = "s", col = "blue")
+mtext(paste0("Autocorelation = ", format(mean(c(mean(autocorrs1[,1]), mean(autocorrs2[,1]))), digits = 2)), side=1, line=0, adj=0.1, cex=1, col="black", outer=TRUE)
+
+#Beta 1: 
+par(oma=c(3,0,0,0)) 
+par(mar=c(5,4,4,2) + 0.1)
+plot(unburn1[,2], type = "s", xlab = "Nr. of iterations", ylab = "", main = bquote(bold(Delta~"Screentime")), col = "red")
+lines(unburn2[,2], type = "s", col = "blue")
+mtext(paste0("Autocorelation = ", format(mean(c(mean(autocorrs1[,2]), mean(autocorrs2[,2]))), digits = 2)), side=1, line=0, adj=0.1, cex=1, col="black", outer=TRUE)
+mtext(paste0("Acceptance rate = ", format(mean(c(AR1, AR2)), digits = 2), "%"), side=1, line=1, adj=0.1, cex=1, col="black", outer=TRUE)
+
+#Beta 2: 
+par(oma=c(3,0,0,0)) 
+par(mar=c(5,4,4,2) + 0.1)
+plot(unburn1[,3], type = "s", xlab = "Nr. of iterations", ylab = "", main = "Age", col = "red")
+lines(unburn2[,3], type = "s", col = "blue")
+mtext(paste0("Autocorelation = ", format(mean(c(mean(autocorrs1[,3]), mean(autocorrs2[,3]))), digits = 2)), side=1, line=0, adj=0.1, cex=1, col="black", outer=TRUE)
+
+#Sigma2
+par(oma=c(3,0,0,0)) 
+par(mar=c(5,4,4,2) + 0.1)
+plot(unburn1[,4], type = "s", xlab = "Nr. of iterations", ylab = "", main = "Residual Variance", col = "red")
+lines(unburn2[,4], type = "s", col = "blue")
+mtext(paste0("Autocorelation = ", format(mean(c(mean(autocorrs1[,4]), mean(autocorrs2[,4]))), digits = 2)), side=1, line=0, adj=0.1, cex=1, col="black", outer=TRUE)
+```
+###Output
+```{r Results}
+results <- matrix(0, 4, 7)
+rownames(results) <- c("Intercept", "Screen.diff", "Age.gmc", "Residual Variance")
+colnames(results) <- c("Mean", "SD", "MC error", "Gelman-Rubin", "2.5%", "Median", "97.5%")
+
+results[,1] <- apply(rbind(apply(unburn1, 2, mean), apply(unburn2, 2, mean)), 2, mean)
+results[,2] <- apply(rbind(apply(unburn1, 2, sd), apply(unburn2, 2, sd)), 2, mean)
+results[,3] <- MCerrcalc(results[,2], 12000)
+results[,4] <- t(GRstat)
+results[,5] <- apply(rbind(apply(unburn1, 2, quantile, 0.025), apply(unburn2, 2, quantile, 0.025)), 2, mean)
+results[,5] <- apply(rbind(apply(unburn1, 2, median), apply(unburn2, 2, median)), 2, mean)
+results[,7] <- apply(rbind(apply(unburn1, 2, quantile, 0.975), apply(unburn2, 2, quantile, 0.975)), 2, mean)
+results
+kable(results, digits = 3)
+```
+#Alternative model
+```{r Alternative model - Sex as predictor instead of Age, same starting values. Rerun from "Assess Convergence" line 191 to assess convergence}
+set.seed(456)
+#Chain 1
+output1 <- THUGS(OSDI.diff6, screen.diff6, dat$Sex, inits1, n.iters = 20000) 
+chain1 <- output1$storage
+
+#Chain 2
+output2 <- THUGS(OSDI.diff6, screen.diff6, dat$Sex, inits2, n.iters = 20000)
+chain2 <- output2$storage
+
+# Update burn-in period
+unburn1 <- chain1[-c(1:1000),]
+unburn2 <- chain2[-c(1:1000),]
+
+#joint posterior with Sex as predictor instead of age
+jointpostSex <- rbind(unburn1, unburn2)
+```
+#Model checks
+```{r DIC NB: RE-RUN ALL CODE UP TO LINE 307 AND SKIP THE CHUNK called "Alternative model" TO GET THE ORIGINAL MODEL WITH AGE}
+DIC <- function(jointposterior) {
+  dbardat <- matrix(0, nrow(dat), 1)
+  for (i in 1:nrow(dbardat)) {
+    dbardat[i] <- -2 * sum(dnorm(OSDI.diff6, mean = (jointposterior[i, 1] + jointposterior[i, 2] * screen.diff6 + jointposterior[i, 3] * age.gmc),
+                                 sd = sqrt(jointposterior[i, 4]), log = T))
+  }
+  dbar <- mean(dbardat)
+  
+  dhat <- -2 * sum(dnorm(OSDI.diff6, mean = mean((jointposterior[i, 1]) + mean(jointposterior[i, 2]) * screen.diff6 + mean(jointposterior[i, 3]) * age.gmc),
+                         sd = sqrt(mean(jointposterior[i, 4])), log = T))
+  
+  DIC <- dhat + 2 * (dbar - dhat)
+  
+  return(DIC)
+}
+
+DIC(jointpostAge) #817
+DIC(jointpostSex) #899
+```
+
+```{r Posterior Predictive Check}
+#Step 1: run again, but now with all uninformative priors: 
+#RE-RUN CHUNK Prior Distributions FIRST, then this one: 
+mu_10 <- 0
+sd_10 <- 1
+
+output11 <- THUGS(OSDI.diff6, screen.diff6, age.gmc, inits1, n.iters = 20000) 
+chain11 <- output11$storage
+
+output22 <- THUGS(OSDI.diff6, screen.diff6, age.gmc, inits2, n.iters = 20000)
+chain22 <- output22$storage
+
+unburn11 <- chain11[-c(1:1000),]
+unburn22 <- chain22[-c(1:1000),]
+
+#Step 2: sample 1000 mu's and sigma's from their posterior distributions with an uninformative prior, where mu = (b0, b1, b2)
+jointpost <- as.data.frame(rbind(unburn11, unburn22))
+n_simdats <- 1000
+sampled_pars <- sample_n(jointpost, n_simdats)
+
+#Step 3: simulate 1000 datasets with each set of sampled parameters
+simdat <- matrix(0, nrow(dat), n_simdats)
+for (i in 1:n_simdats) {
+  simdat[,i] <- rnorm(nrow(dat), mean = (jointpost[i,1] + jointpost[i,2] * screen.diff6 + jointpost[i,3] * age.gmc), sd = sqrt(jointpost[i,4]))
+}
+
+#Step 4: Compute test statistic for each of the simulated data sets and of the observed dataset
+pvalcalc <- function(obsdat, simdat, teststatfun) {
+  #create storage:
+  testsim <- matrix(0, ncol(simdat), 1)
+  comparisons <- matrix(0, nrow(testsim), 1)
+  
+  #compute test statistic for observed and simulated data
+  testobs <- teststatfun(obsdat)
+  for (i in 1:ncol(simdat)) {
+    testsim[i, ] <- teststatfun(simdat[, i])
+  }
+  
+  #Step 5: compute posterior predictive p-value: 
+    for (i in 1:nrow(testsim)) {
+    if (testsim[i, ] > testobs) {
+      comparisons[i, ] <- 1
+    }
+    }
+  Bpvalue <- mean(comparisons)
+  
+  return(Bpvalue)
+}
+
+#run with my own test statistics
+skewcalc <- function(dataset){
+  sorted <- sort(dataset)
+  R <- length(sorted[sorted > mean(dataset)]) #counts nr. of bins right of the mean
+  L <- length(sorted[sorted < mean(dataset)]) #counts nr. of bins left of the mean
+  
+  LRratio <- R/L #ratio of nr of bins right/left to mean
+  absdiff <- abs(1-LRratio) #absolute difference compared to 1 (no difference between L and R)
+  return(absdiff)
+}
+
+pvalcalc(OSDI.diff6, simdat, skewcalc) #0.433 = not skewed
+pvalcalc(OSDI.diff6, simdat, skewness) #check against existing function, = probably skewed
+
+pvalcalc(OSDI.diff6, simdat, kurtosis) #kurtosis = definitely leptokurtic
+
+```
+
+```{r Bayes Factor}
+#run linear model
+mod1 <- lm(OSDI.diff6 ~ screen.diff6 + age.gmc)
+
+#H0: effect of screen difference is larger than 0
+BF1 <- bain(mod1, "screen.diff6 > 0")
+print(BF1)
+
+#H0: effect of age is smaller than zero
+BF2 <- bain(mod1, "age.gmc > 0")
+print(BF2)
+
+#Longitudinal: OSDI week 6 > OSDI week 4 > OSDI week 2
+OSDIprogression <-  lm(OSDI ~ Week-1, data = dat.long) #calculate means per week
+BF5 <- bain(OSDIprogression, "Week6 > Week4 > Week2; Week6 = Week4 > Week2; Week6 = Week4 = Week2")
+print(BF5)
+```
+
+
+
+
