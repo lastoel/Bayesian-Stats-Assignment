@@ -200,7 +200,7 @@ save.image("Workspaces/Model2.Rdata")
 
 
 #Model checks
-```{r DIC NB: RE-RUN ALL CODE UP TO LINE 307 AND SKIP THE CHUNK called "Alternative model" TO GET THE ORIGINAL MODEL WITH AGE}
+```{r DIC}
 source("Functions/DIC.R")
 
 DIC(jointpostAge) #817
